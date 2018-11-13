@@ -1,0 +1,141 @@
+- name: Ensure folders exist
+  file:
+    path: "/home/pi/{{ item }}"
+    state: directory
+    owner: pi
+    group: pi
+  with_items:
+    - .screenly
+    - screenly_assets
+
+- name: Copy Screenly default config
+  copy:
+    owner: pi
+    group: pi
+    src: screenly.conf
+    dest: /home/pi/.screenly/screenly.conf
+    force: no
+
+- name: Remove deprecated parameter "listen"
+  lineinfile:
+    regexp: '^.*listen.*'
+    state: absent
+    dest: /home/pi/.screenly/screenly.conf
+
+- name: Install pip dependencies
+  pip: requirements=/home/pi/screenly/requirements.host.txt
+
+- name: Create default assets database if does not exists
+  copy:
+    owner: pi
+    group: pi
+    src: screenly.db
+    dest: /home/pi/.screenly/screenly.db
+    force: no
+
+- name: Run database migration
+  become: no
+  command: python /home/pi/screenly/bin/migrate.py
+  register: migrate
+
+- debug: msg="{{ migrate.stdout }}"
+
+- name: Copy screenly_utils.sh
+  copy:
+    src: screenly_utils.sh
+    dest: /usr/local/bin/screenly_utils.sh
+    mode: 0755
+    owner: root
+    group: root
+
+- cron:
+    name: Cleanup screenly_assets
+    minute: 0
+    hour: 1
+    job: "/usr/local/bin/screenly_utils.sh cleanup"
+    user: pi
+
+- name: Copy screenly_overrides
+  copy:
+    src: screenly_overrides
+    dest: /etc/sudoers.d/screenly_overrides
+    mode: 0440
+    owner: root
+    group: root
+
+- name: Check if deprecated systemd services exists
+  stat:
+    path: /etc/systemd/system/X.service
+  register: x_service
+
+- set_fact: x_service_exist="{{x_service.stat.exists}}"
+
+- name: Disable deprecated systemd services
+  systemd:
+    name: "{{ item }}"
+    state: stopped
+    enabled: no
+  with_items: "{{ screenly_systemd_units }}"
+  when: x_service_exist
+
+- name: Remove deprecated systemd units
+  file:
+    path: "/etc/systemd/system/{{ item }}"
+    state: absent
+  with_items: "{{ screenly_systemd_units }}"
+
+- name: Check /proc/device-tree/model file
+  command: cat /proc/device-tree/model
+  register: model_file
+
+- debug:
+    msg: "Device type: {{ device_type }}"
+
+- debug:
+    msg: "Use {{ docker_tag }} version of images."
+
+- name: Create screenly-server container
+  docker_container:
+    name: screenly-ose-server
+    image: "screenly/screenly-ose-server:{{ docker_tag }}"
+    pull: true
+    state: started
+    recreate: true
+    restart_policy: unless-stopped
+    network_mode: host
+    privileged: yes
+    volumes:
+      - /home/pi/screenly:/home/pi/screenly
+      - /home/pi/.screenly:/home/pi/.screenly
+      - /home/pi/screenly_assets:/home/pi/screenly_assets
+
+- name: Create screenly-viewer container
+  docker_container:
+    name: screenly-ose-viewer
+    image: "screenly/screenly-ose-viewer:{{ docker_tag }}-{{ device_type }}"
+    pull: true
+    state: started
+    recreate: true
+    restart_policy: unless-stopped
+    network_mode: host
+    privileged: yes
+    volumes:
+      - /home/pi/screenly:/home/pi/screenly
+      - /home/pi/.screenly:/home/pi/.screenly
+      - /home/pi/screenly_assets:/home/pi/screenly_assets
+
+- name: Pause screenly-viewer container
+  command: docker pause screenly-ose-viewer
+
+- name: Create screenly-websocket-server container
+  docker_container:
+    name: screenly-ose-websocket
+    image: "screenly/screenly-ose-websocket:{{ docker_tag }}"
+    pull: true
+    state: started
+    recreate: true
+    restart_policy: unless-stopped
+    network_mode: host
+    volumes:
+      - /home/pi/screenly:/home/pi/screenly
+      - /home/pi/.screenly:/home/pi/.screenly
